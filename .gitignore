@@ -1,0 +1,19 @@
+# Binaries
+/invtts
+Invtts.app
+macos/build/
+macos/Resources/AppIcon.iconset/
+*.exe
+*.test
+
+# Generated audio
+*.mp3
+*.wav
+*.flac
+*.opus
+*.aac
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

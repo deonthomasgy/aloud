@@ -1,0 +1,10 @@
+invtts
+*.mp3
+*.wav
+*.flac
+*.opus
+*.aac
+.git
+.DS_Store
+.idea
+.vscode

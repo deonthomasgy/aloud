@@ -1,0 +1,9 @@
+# invtts runs locally; point at Kokoro on alpha-old (Tailscale IP for in-container reachability)
+services:
+  invtts:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      KOKORO_BASE_URL: http://100.89.61.7:8880/v1
+    restart: unless-stopped
