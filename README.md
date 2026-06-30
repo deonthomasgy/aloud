@@ -69,6 +69,18 @@ Open **http://localhost:8090**. Create a project, upload some page photos, and
 watch them turn into a read-along book. Data (database, uploaded images, cached
 audio) lives in the `invtts-data` Docker volume and survives rebuilds.
 
+**Or run the published image** from Docker Hub
+([`princeamd/aloud`](https://hub.docker.com/r/princeamd/aloud)) — no source
+checkout needed:
+
+```bash
+docker run -d --name aloud -p 8090:8080 \
+  -e GEMINI_API_KEY=your-key \
+  -e KOKORO_BASE_URL=http://<host>:8880/v1 \
+  -v aloud-data:/data \
+  princeamd/aloud:latest
+```
+
 **Or run it locally** (Go 1.25+):
 
 ```bash

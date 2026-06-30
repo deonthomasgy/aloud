@@ -2,6 +2,7 @@
 # Secrets (GEMINI_API_KEY) come from a local .env file — see .env.example.
 services:
   invtts:
+    image: princeamd/aloud:latest
     build: .
     ports:
       - "8090:8080"
