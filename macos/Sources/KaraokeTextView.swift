@@ -1,41 +1,115 @@
+import AppKit
 import SwiftUI
 
-/// SwiftUI text view with live word highlight during playback.
-/// Equatable so playback-time slider ticks don't rebuild the full attributed string.
-struct KaraokeTextView: View, Equatable {
+/// NSTextView-backed karaoke display — efficient highlight updates without rebuilding AttributedString.
+struct KaraokeTextView: NSViewRepresentable {
     let text: String
     let wordRanges: [NSRange]
     let activeWordIndex: Int?
 
-    var body: some View {
-        ScrollView {
-            Text(highlightedText)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-                .textSelection(.enabled)
-        }
-        .frame(minHeight: 160)
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
     }
 
-    static func == (lhs: KaraokeTextView, rhs: KaraokeTextView) -> Bool {
-        lhs.text == rhs.text
-            && lhs.activeWordIndex == rhs.activeWordIndex
-            && lhs.wordRanges.count == rhs.wordRanges.count
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = true
+        scroll.backgroundColor = .textBackgroundColor
+
+        let textView = KaraokeNSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = true
+        textView.backgroundColor = .textBackgroundColor
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.font = .systemFont(ofSize: NSFont.systemFontSize)
+        textView.textColor = .labelColor
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: scroll.contentSize.width,
+            height: .greatestFiniteMagnitude
+        )
+
+        scroll.documentView = textView
+        context.coordinator.textView = textView
+        return scroll
     }
 
-    private var highlightedText: AttributedString {
-        var attributed = AttributedString(text)
-        guard let idx = activeWordIndex,
-              idx < wordRanges.count,
-              wordRanges[idx].location != NSNotFound,
-              let swiftRange = Range(wordRanges[idx], in: text),
-              let start = AttributedString.Index(swiftRange.lowerBound, within: attributed),
-              let end = AttributedString.Index(swiftRange.upperBound, within: attributed)
-        else {
-            return attributed
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = context.coordinator.textView else { return }
+
+        if textView.string != text {
+            textView.string = text
+            context.coordinator.lastActiveIndex = nil
         }
-        attributed[start..<end].backgroundColor = Color.accentColor.opacity(0.5)
-        attributed[start..<end].font = .body.bold()
-        return attributed
+
+        let highlightIndex = resolvedHighlightIndex()
+        guard highlightIndex != context.coordinator.lastActiveIndex else { return }
+        context.coordinator.lastActiveIndex = highlightIndex
+        context.coordinator.applyHighlight(
+            in: text,
+            wordRanges: wordRanges,
+            activeIndex: highlightIndex
+        )
+
+        if let highlightIndex,
+           highlightIndex < wordRanges.count,
+           wordRanges[highlightIndex].location != NSNotFound {
+            textView.scrollRangeToVisible(wordRanges[highlightIndex])
+        }
+    }
+
+    /// Skip timestamp indices whose source range could not be mapped.
+    private func resolvedHighlightIndex() -> Int? {
+        guard let idx = activeWordIndex else { return nil }
+        if idx < wordRanges.count, wordRanges[idx].location != NSNotFound {
+            return idx
+        }
+        return wordRanges.indices.first { $0 >= idx && wordRanges[$0].location != NSNotFound }
+    }
+
+    final class Coordinator {
+        weak var textView: KaraokeNSTextView?
+        var lastActiveIndex: Int?
+
+        private let baseAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: NSFont.systemFontSize),
+            .foregroundColor: NSColor.labelColor,
+        ]
+
+        private let highlightAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
+            .foregroundColor: NSColor.labelColor,
+            .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.45),
+        ]
+
+        func applyHighlight(in text: String, wordRanges: [NSRange], activeIndex: Int?) {
+            guard let textView, let storage = textView.textStorage else { return }
+            let full = NSRange(location: 0, length: (text as NSString).length)
+            storage.setAttributes(baseAttributes, range: full)
+
+            guard let activeIndex,
+                  activeIndex < wordRanges.count,
+                  wordRanges[activeIndex].location != NSNotFound
+            else { return }
+
+            let range = wordRanges[activeIndex]
+            guard NSMaxRange(range) <= full.length else { return }
+            storage.addAttributes(highlightAttributes, range: range)
+        }
+    }
+}
+
+/// Suppresses the focus ring when embedded in SwiftUI.
+final class KaraokeNSTextView: NSTextView {
+    override var focusRingType: NSFocusRingType {
+        get { .none }
+        set {}
     }
 }

@@ -66,27 +66,29 @@ struct ContentView: View {
     private var textSection: some View {
         Section {
             ZStack(alignment: .topLeading) {
+                TextEditor(text: $model.text)
+                    .font(.body)
+                    .frame(minHeight: 160)
+                    .disabled(model.showKaraoke)
+                    .opacity(model.showKaraoke ? 0 : 1)
+                    .overlay(alignment: .topLeading) {
+                        if model.text.isEmpty, !model.showKaraoke {
+                            Text("Paste or type text to turn into speech…")
+                                .foregroundStyle(.tertiary)
+                                .padding(.top, 8)
+                                .padding(.leading, 8)
+                                .allowsHitTesting(false)
+                        }
+                    }
+
                 if model.showKaraoke {
                     KaraokeTextView(
                         text: model.spokenText,
                         wordRanges: model.wordRanges,
                         activeWordIndex: model.activeWordIndex
                     )
-                    .equatable()
+                    .frame(minHeight: 160)
                     .zIndex(1)
-                } else {
-                    TextEditor(text: $model.text)
-                        .font(.body)
-                        .frame(minHeight: 160)
-                        .overlay(alignment: .topLeading) {
-                            if model.text.isEmpty {
-                                Text("Paste or type text to turn into speech…")
-                                    .foregroundStyle(.tertiary)
-                                    .padding(.top, 8)
-                                    .padding(.leading, 8)
-                                    .allowsHitTesting(false)
-                            }
-                        }
                 }
             }
         } header: {
@@ -180,6 +182,29 @@ struct ContentView: View {
                     model.saveAudio()
                 }
             }
+
+            if !model.suggestedAudioSlug.isEmpty || model.isDerivingTitle {
+                HStack(spacing: 6) {
+                    if model.isDerivingTitle {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Deriving title…")
+                    } else {
+                        Image(systemName: "tag.fill")
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.suggestedAudioSlug)
+                                .font(.caption.weight(.medium))
+                            if !model.suggestedAudioSummary.isEmpty {
+                                Text(model.suggestedAudioSummary)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -234,6 +259,21 @@ struct SettingsView: View {
             }
             Section {
                 Text("Default: Kokoro on alpha-old over Tailscale. Change if your endpoint is elsewhere.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Audio titles") {
+                Toggle("Use LLM for titles", isOn: $model.titleUseLLM)
+                TextField("LLM API URL", text: $model.titleLLMBaseURL, prompt: Text("http://host:11434/v1"))
+                TextField("Model", text: $model.titleLLMModel, prompt: Text("llama3.2"))
+                TextField("API key (optional)", text: $model.titleLLMAPIKey)
+                Button("Use Ollama on Kokoro host") {
+                    model.applySuggestedLLMURL()
+                }
+            }
+            Section {
+                Text("Titles are derived from speech content for AI-friendly filenames. With no LLM configured, on-device language analysis is used. Saving also writes a .invtts.json sidecar.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

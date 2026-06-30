@@ -13,7 +13,14 @@ macos/Resources/AppIcon.iconset/
 *.opus
 *.aac
 
+# Local data (SQLite DB, uploaded images, cached audio) and secrets
+/data
+.env
+
 # OS / editor
 .DS_Store
 .idea/
 .vscode/
+
+# Local DB backups
+/backups

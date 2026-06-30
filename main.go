@@ -16,30 +16,38 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
 
-//go:embed web/index.html
+//go:embed web
 var webFS embed.FS
 
 // config holds runtime settings, all overridable via environment variables.
 type config struct {
-	addr      string // HTTP listen address, e.g. ":8080"
-	baseURL   string // Kokoro OpenAI-compatible base URL, e.g. http://localhost:8880/v1
-	apiKey    string // API key sent as Bearer token (Kokoro ignores it but OpenAI clients require one)
-	model     string // model name passed upstream
-	maxChars  int    // reject requests longer than this
+	addr        string // HTTP listen address, e.g. ":8080"
+	baseURL     string // Kokoro OpenAI-compatible base URL, e.g. http://localhost:8880/v1
+	apiKey      string // API key sent as Bearer token (Kokoro ignores it but OpenAI clients require one)
+	model       string // model name passed upstream
+	maxChars    int    // reject requests longer than this
+	dataDir     string // where the SQLite DB, uploads, and cached audio live
+	geminiKey   string // Google Gemini API key for OCR
+	geminiModel string // Gemini model used for OCR
 }
 
 func loadConfig() config {
 	return config{
-		addr:     env("PORT_ADDR", ":"+env("PORT", "8080")),
-		baseURL:  strings.TrimRight(env("KOKORO_BASE_URL", "http://alpha-old:8880/v1"), "/"),
-		apiKey:   env("KOKORO_API_KEY", "not-needed"),
-		model:    env("KOKORO_MODEL", "kokoro"),
-		maxChars: envInt("KOKORO_MAX_CHARS", 50000),
+		addr:        env("PORT_ADDR", ":"+env("PORT", "8080")),
+		baseURL:     strings.TrimRight(env("KOKORO_BASE_URL", "http://alpha-old:8880/v1"), "/"),
+		apiKey:      env("KOKORO_API_KEY", "not-needed"),
+		model:       env("KOKORO_MODEL", "kokoro"),
+		maxChars:    envInt("KOKORO_MAX_CHARS", 50000),
+		dataDir:     env("DATA_DIR", "/data"),
+		geminiKey:   env("GEMINI_API_KEY", ""),
+		geminiModel: env("GEMINI_MODEL", "gemini-3.5-flash"),
 	}
 }
 
@@ -87,16 +95,41 @@ var allowedFormats = map[string]string{
 
 func main() {
 	cfg := loadConfig()
-	srv := &server{cfg: cfg, client: &http.Client{Timeout: 5 * time.Minute}}
+
+	if err := os.MkdirAll(cfg.dataDir, 0o755); err != nil {
+		log.Fatalf("could not create data dir %q: %v", cfg.dataDir, err)
+	}
+	st, err := openStore(filepath.Join(cfg.dataDir, "invtts.db"))
+	if err != nil {
+		log.Fatalf("could not open database: %v", err)
+	}
+
+	srv := &server{cfg: cfg, client: &http.Client{Timeout: 5 * time.Minute}, store: st}
 
 	mux := http.NewServeMux()
+	// Static SPA + simple TTS API (original).
 	mux.HandleFunc("/", srv.handleIndex)
 	mux.HandleFunc("/api/health", srv.handleHealth)
 	mux.HandleFunc("/api/voices", srv.handleVoices)
 	mux.HandleFunc("/api/tts", srv.handleTTS)
 
+	// Projects API.
+	mux.HandleFunc("GET /api/projects", srv.handleListProjects)
+	mux.HandleFunc("POST /api/projects", srv.handleCreateProject)
+	mux.HandleFunc("GET /api/projects/{id}", srv.handleGetProject)
+	mux.HandleFunc("DELETE /api/projects/{id}", srv.handleDeleteProject)
+	mux.HandleFunc("POST /api/projects/{id}/pages", srv.handleUploadPages)
+	mux.HandleFunc("POST /api/projects/{id}/reorder", srv.handleReorderPages)
+	mux.HandleFunc("POST /api/projects/{id}/auto-order", srv.handleAutoOrder)
+	mux.HandleFunc("PUT /api/paragraphs/{id}", srv.handleUpdateParagraph)
+	mux.HandleFunc("POST /api/paragraphs/{id}/speech", srv.handleParagraphSpeech)
+	mux.HandleFunc("POST /api/speak", srv.handleSpeak)
+	mux.HandleFunc("GET /api/pages/{id}/image", srv.handlePageImage)
+	mux.HandleFunc("GET /api/audio/{file}", srv.handleAudio)
+
 	log.Printf("invtts listening on %s", cfg.addr)
 	log.Printf("Kokoro endpoint: %s (model %q)", cfg.baseURL, cfg.model)
+	log.Printf("Data dir: %s · Gemini OCR model: %s (key set: %v)", cfg.dataDir, cfg.geminiModel, cfg.geminiKey != "")
 	if err := http.ListenAndServe(cfg.addr, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -105,12 +138,31 @@ func main() {
 type server struct {
 	cfg    config
 	client *http.Client
+	store  *store
+}
+
+// staticExts are file types served directly from the embedded web/ dir.
+var staticContentTypes = map[string]string{
+	".css":  "text/css; charset=utf-8",
+	".js":   "text/javascript; charset=utf-8",
+	".svg":  "image/svg+xml",
+	".png":  "image/png",
+	".ico":  "image/x-icon",
+	".json": "application/json",
 }
 
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
+	// Serve a real embedded asset if one matches; otherwise fall back to the
+	// SPA shell so client-side hash routing works on any path.
+	clean := path.Clean(r.URL.Path)
+	if clean != "/" && !strings.HasPrefix(clean, "/api/") {
+		if data, err := webFS.ReadFile("web" + clean); err == nil {
+			if ct, ok := staticContentTypes[strings.ToLower(filepath.Ext(clean))]; ok {
+				w.Header().Set("Content-Type", ct)
+			}
+			_, _ = w.Write(data)
+			return
+		}
 	}
 	data, err := webFS.ReadFile("web/index.html")
 	if err != nil {

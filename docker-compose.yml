@@ -1,9 +1,17 @@
-# invtts runs locally; point at Kokoro on alpha-old (Tailscale IP for in-container reachability)
+# invtts runs locally; point at Kokoro on alpha-old (Tailscale IP for in-container reachability).
+# Secrets (GEMINI_API_KEY) come from a local .env file — see .env.example.
 services:
   invtts:
     build: .
     ports:
-      - "8080:8080"
+      - "8090:8080"
     environment:
       KOKORO_BASE_URL: http://100.89.61.7:8880/v1
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+    volumes:
+      - invtts-data:/data
     restart: unless-stopped
+
+volumes:
+  invtts-data:

@@ -8,3 +8,10 @@ invtts
 .DS_Store
 .idea
 .vscode
+.env
+data/
+/data
+macos/
+Invtts.app/
+scripts/
+*.md

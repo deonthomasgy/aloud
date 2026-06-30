@@ -15,11 +15,23 @@ struct WordTimestamp: Identifiable, Equatable {
 
     init?(id: Int, json: [String: Any]) {
         guard let word = json["word"] as? String else { return nil }
-        let start = (json["start_time"] as? Double) ?? (json["start"] as? Double) ?? 0
-        let end = (json["end_time"] as? Double) ?? (json["end"] as? Double) ?? start
+        let start = Self.parseTime(json["start_time"] ?? json["start"])
+        let endValue = json["end_time"] ?? json["end"]
+        let end = endValue == nil ? start : Self.parseTime(endValue)
         self.id = id
         self.word = word
         self.startTime = start
         self.endTime = end
+    }
+
+    private static func parseTime(_ value: Any?) -> Double {
+        switch value {
+        case let n as Double: return n
+        case let n as Float: return Double(n)
+        case let n as Int: return Double(n)
+        case let n as NSNumber: return n.doubleValue
+        case let s as String: return Double(s) ?? 0
+        default: return 0
+        }
     }
 }

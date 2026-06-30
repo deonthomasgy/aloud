@@ -1,132 +1,134 @@
-# invtts — Kokoro Text-to-Speech
+# Aloud — read your books out loud
 
-A small Go web app with a clean UI for pasting text and turning it into
-natural-sounding speech using the [Kokoro-82M](https://kokorottsai.com/#tryonline)
-TTS model.
+**Aloud** turns photos of book pages into a warm, hands-free read-along
+experience. Snap pictures of the pages (or paste raw text), and Aloud uses
+**Google Gemini** to OCR them into clean, ordered **pages and paragraphs**,
+then generates natural speech with **Kokoro TTS** and highlights each word as
+it's spoken — karaoke style.
 
-`kokorottsai.com` itself is a demo/marketing site with no callable API, so this
-app talks to a **self-hosted, OpenAI-compatible Kokoro endpoint** (e.g.
-[Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) or
-[docker-kokoro](https://github.com/hwdsl2/docker-kokoro)). The Go server proxies
-synthesis requests to that endpoint, so your browser never needs the upstream URL
-or key.
+It's a single self-contained Go binary (SQLite + embedded vanilla-JS UI, no
+build step) that proxies OCR to Gemini and synthesis to a self-hosted,
+OpenAI-compatible Kokoro endpoint.
+
+![Aloud — desktop reading view](docs/img/desktop.png)
+
+<p align="center">
+  <img src="docs/img/mobile.png" alt="Aloud — mobile player" width="320">
+</p>
+
+## What it does
+
+- **Projects** — group a book (or any document) into one place.
+- **Photograph a book** — upload multiple page photos at once, in any order, or
+  paste plain text.
+- **Gemini OCR** — each image is transcribed verbatim into paragraphs, chapter
+  titles preserved, running headers/footers dropped.
+- **Smart page ordering** — pages are auto-ordered by detected page number; when
+  numbers are missing, Gemini reorders them by narrative continuity. You can also
+  drag to reorder manually.
+- **Read-along karaoke** — click a paragraph (or "play page") and listen while
+  the current word lights up, synced from Kokoro's word timestamps.
+- **Seamless cross-page flow** — when a paragraph runs across a page break, Aloud
+  detects the continuation and synthesizes it as one clip, so there's no pause
+  mid-sentence.
+- **Natural emphasis** — ALL-CAPS emphasis words are read naturally instead of
+  being spelled out letter by letter.
+- **Edit & regenerate** — fix an OCR slip or re-synthesize a phrase on demand.
+- **Remembers where you were** — the current page is restored on refresh.
+- **Desktop + mobile** — a warm editorial desktop layout and a dedicated mobile
+  bottom-player with voice/speed pills and a hamburger menu.
 
 ```
-browser  ──►  invtts (local, :8080)  ──►  Kokoro on alpha-old (:8880, /v1/audio/speech)
+browser ──► Aloud (Go, :8090) ──► Gemini  (OCR: page photos → text)
+                              └──► Kokoro (TTS: text → audio + word timestamps)
 ```
 
-## Quick start (native macOS app)
+## Quick start
 
-Build and open the **SwiftUI desktop app** — no browser, no local server:
+Aloud needs a **Google Gemini API key** (for OCR) and a reachable **Kokoro**
+endpoint (for speech).
+
+**1. Configure secrets** — copy the example and fill in your key:
 
 ```bash
-make app
-open Invtts.app
+cp .env.example .env
+# edit .env:
+#   GEMINI_API_KEY=your-key-from-https://aistudio.google.com/apikey
+#   KOKORO_BASE_URL=http://<your-kokoro-host>:8880/v1
 ```
 
-The app talks directly to Kokoro on **alpha-old** (`http://alpha-old:8880/v1`). Change the endpoint in **Invtts → Settings** if needed.
+> `.env` is gitignored — your key never gets committed.
 
-## Quick start (web UI, optional)
-
-Kokoro runs in Docker on **alpha-old** (Tailscale). The Go server proxies to it — default `KOKORO_BASE_URL` is `http://alpha-old:8880/v1`.
-
-**1. Start Kokoro on alpha-old** (once, or after updates):
+**2. Run it in Docker:**
 
 ```bash
-make kokoro-up
-# or: ./scripts/kokoro-alpha-old.sh up
+docker compose up --build -d
 ```
 
-**2. Run invtts locally:**
+Open **http://localhost:8090**. Create a project, upload some page photos, and
+watch them turn into a read-along book. Data (database, uploaded images, cached
+audio) lives in the `invtts-data` Docker volume and survives rebuilds.
+
+**Or run it locally** (Go 1.25+):
 
 ```bash
-go run .
-```
-
-Open http://localhost:8080. The footer shows whether Kokoro is reachable.
-
-Check Kokoro from here:
-
-```bash
-make kokoro-status
-curl http://alpha-old:8880/v1/models
-```
-
-## Kokoro on alpha-old
-
-The helper script SSHs to `alpha-old` and manages the `kokoro` container:
-
-```bash
-./scripts/kokoro-alpha-old.sh up       # pull + start
-./scripts/kokoro-alpha-old.sh status   # container + HTTP probe
-./scripts/kokoro-alpha-old.sh logs     # tail logs
-./scripts/kokoro-alpha-old.sh down     # stop and remove
-```
-
-Override the SSH host with `KOKORO_HOST` if needed.
-
-**GPU note:** alpha-old has a Radeon 780M iGPU (`gfx1103`). The official ROCm
-image (`kokoro-fastapi-rocm`) fails on this chip because PyTorch only ships HIP
-kernels for `gfx1100`–`gfx1102`, not `gfx1103` — you get `HIP error: invalid
-device function`. The deploy script defaults to the **CPU** image, which works.
-To force ROCm anyway: `KOKORO_DEVICE=rocm ./scripts/kokoro-alpha-old.sh up`.
-
-To run Kokoro somewhere else instead, set `KOKORO_BASE_URL` (see Configuration).
-
-## Run invtts in Docker (optional)
-
-If you prefer a containerised UI locally (still talks to alpha-old):
-
-```bash
-docker compose up --build
+GEMINI_API_KEY=... KOKORO_BASE_URL=http://<host>:8880/v1 go run .
 ```
 
 ## Configuration
 
-All optional, set via environment variables:
+All set via environment variables (see `.env.example`):
 
-| Variable           | Default                     | Description                                  |
-|--------------------|-----------------------------|----------------------------------------------|
-| `PORT`             | `8080`                      | Port the web UI listens on                   |
-| `KOKORO_BASE_URL`  | `http://alpha-old:8880/v1`  | OpenAI-compatible Kokoro base URL            |
-| `KOKORO_API_KEY`   | `not-needed`                | Bearer token sent upstream                   |
-| `KOKORO_MODEL`     | `kokoro`                    | Model name passed upstream                   |
-| `KOKORO_MAX_CHARS` | `50000`                     | Reject text longer than this                 |
+| Variable          | Default               | Description                                   |
+|-------------------|-----------------------|-----------------------------------------------|
+| `GEMINI_API_KEY`  | _(required for OCR)_  | Google Gemini API key used to OCR page photos |
+| `GEMINI_MODEL`    | `gemini-3.5-flash`    | Gemini model used for OCR + page ordering     |
+| `KOKORO_BASE_URL` | `http://alpha-old:8880/v1` | OpenAI-compatible Kokoro base URL        |
+| `KOKORO_API_KEY`  | `not-needed`          | Bearer token sent upstream to Kokoro          |
+| `KOKORO_MODEL`    | `kokoro`              | Model name passed upstream                    |
+| `DATA_DIR`        | `/data`               | Where the DB, images, and audio cache live    |
+| `PORT`            | `8080`                | Port inside the container (host maps to 8090) |
 
-Example:
+## How it works
 
-```bash
-KOKORO_BASE_URL=http://192.168.1.50:8880/v1 PORT=9000 go run .
-```
-
-## Features
-
-- Beautiful single-page UI (no build step — HTML/CSS/JS is embedded in the binary)
-- Full Kokoro voice catalogue grouped by language (American/British English,
-  Japanese, Mandarin, French, Hindi, Italian, Portuguese, Spanish), defaulting to
-  `af_heart`
-- Selectable output format (MP3, WAV, Opus, FLAC, AAC) and speed (0.5×–2×)
-- Inline player + one-click download
-- Server-side validation of voice, format, speed, and length
+- **Persistence** — SQLite (`modernc.org/sqlite`, pure Go, `CGO_ENABLED=0`) with
+  additive migrations. Schema: `projects → pages → paragraphs`.
+- **OCR** (`ocr.go`) — Gemini `generateContent` with a JSON response schema:
+  `{page_number, continues_previous_page, paragraphs[]}`.
+- **Ordering** (`order.go`) — numeric when all pages are numbered, else Gemini
+  orders by content flow.
+- **TTS** (`kokoro.go`) — Kokoro `/dev/captioned_speech` returns base64 audio +
+  `{word, start_time, end_time}` timestamps that drive the karaoke highlight.
+- **Audio cache** — content-addressed by `sha256(text|voice|speed|format)`, so
+  identical synth requests are served from disk.
+- **Frontend** (`web/`) — a hash-routed vanilla-JS SPA embedded via `//go:embed`,
+  with prefetch/look-ahead so the next paragraph is ready before you need it.
 
 ## Project layout
 
 ```
-macos/                   Native SwiftUI macOS app (Invtts.app)
-main.go                  HTTP server (optional web UI)
-voices.go                Kokoro voice catalogue + validation
-web/index.html           Embedded single-page UI
-scripts/kokoro-alpha-old.sh  Deploy/manage Kokoro Docker on alpha-old
-Dockerfile               Multi-stage build for containerised invtts
-docker-compose.yml       Local invtts container (points at alpha-old)
-Makefile                 run, build, test, kokoro-up/down shortcuts
+main.go          HTTP server, config, routing, embedded web/
+store.go         SQLite store + migrations + CRUD
+ocr.go           Gemini OCR (page photo → paragraphs)
+order.go         Page ordering (numeric + AI content-flow)
+kokoro.go        Kokoro captioned-speech client
+text.go          Speech normalization (emphasis handling)
+projects.go      Project/page/paragraph + speech HTTP handlers
+voices.go        Kokoro voice catalogue + validation
+web/             Embedded SPA (index.html, app.js, styles.css)
+docs/img/        Screenshots
+Dockerfile       Multi-stage build (golang:1.25-alpine, CGO off)
+docker-compose.yml  Container + invtts-data volume, host :8090
+macos/           Native SwiftUI app (earlier standalone TTS client)
 ```
 
 ## API
 
-`GET /api/health` — JSON `{ "status": "ok", "endpoint", "model" }` or 503 if Kokoro is unreachable.
-
-`POST /api/tts` — JSON `{ "text", "voice", "format", "speed" }`, returns raw
-audio bytes with the matching `Content-Type`.
-
-`GET /api/voices` — JSON `{ "default", "groups": [{ "language", "voices": [...] }] }`.
+- `GET /api/projects` · `POST /api/projects` · `GET /api/projects/{id}` · `DELETE /api/projects/{id}`
+- `POST /api/projects/{id}/pages` — multipart image(s) or `text`; OCRs async.
+- `POST /api/projects/{id}/reorder` · `POST /api/projects/{id}/autoorder`
+- `PUT /api/paragraphs/{id}` — edit text (clears cached audio).
+- `POST /api/paragraphs/{id}/speech` — lazy synth, returns audio URL + timestamps.
+- `POST /api/speak` — synth arbitrary combined text (used for cross-page flow).
+- `GET /api/audio/{file}` · `GET /api/pages/{id}/image`
+- `GET /api/health` · `GET /api/voices`

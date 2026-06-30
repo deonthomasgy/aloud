@@ -63,6 +63,50 @@ enum SpeechText {
         }
         return out
     }
+
+    /// Filesystem-safe slug from the start of prepared speech text.
+    static func filenameSlug(from text: String, maxWords: Int = 8, maxLength: Int = 56) -> String {
+        let cleaned = sanitize(text)
+        guard !cleaned.isEmpty else { return "" }
+
+        let firstLine = cleaned
+            .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            .first
+            .map(String.init) ?? cleaned
+
+        var slug = firstLine
+            .split(whereSeparator: \.isWhitespace)
+            .prefix(maxWords)
+            .map { word -> String in
+                word.lowercased()
+                    .unicodeScalars
+                    .filter { CharacterSet.alphanumerics.contains($0) }
+                    .map(String.init)
+                    .joined()
+            }
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+
+        if slug.count > maxLength {
+            slug = String(slug.prefix(maxLength))
+                .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        }
+        return slug
+    }
+
+    /// Default filename for a synthesized clip, e.g. `hello-world-this-is-a-test.mp3`.
+    static func suggestedAudioFilename(text: String, voice: String, format: String) -> String {
+        let slug = filenameSlug(from: text)
+        let base = slug.isEmpty ? "speech-\(voice)" : slug
+        return "\(base).\(format)"
+    }
+
+    /// Filename from an already-derived topic slug.
+    static func suggestedAudioFilename(slug: String, format: String) -> String {
+        let base = slug.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty else { return "speech-clip.\(format)" }
+        return "\(base).\(format)"
+    }
 }
 
 struct TextToken {
@@ -83,104 +127,123 @@ enum TextAlignment {
             return TextAlignmentResult(displayText: sanitized, ranges: [])
         }
 
-        let tokens = tokenize(sanitized)
+        let sequential = alignSequential(text: sanitized, timestamps: timestamps)
+        let hits = sequential.ranges.filter { $0.location != NSNotFound }.count
+        let threshold = max(1, (timestamps.count * 2) / 3)
+
+        if hits >= threshold {
+            return sequential
+        }
+        return buildFromTimestamps(timestamps)
+    }
+
+    /// Walk source text left-to-right, matching each Kokoro timestamp in order.
+    /// Handles punctuation split across tokens (e.g. Kokoro: "world" + "," vs source "world,").
+    private static func alignSequential(text: String, timestamps: [WordTimestamp]) -> TextAlignmentResult {
+        let ns = text as NSString
         var ranges: [NSRange] = []
-        var tokenIdx = 0
+        var cursor = 0
 
         for ts in timestamps {
-            let target = SpeechText.normalizeToken(ts.word)
+            let target = ts.word
+            let normTarget = SpeechText.normalizeToken(target)
 
-            if target.isEmpty {
-                if let r = matchPunctuation(ts.word, in: sanitized, tokens: tokens, from: &tokenIdx, ranges: ranges) {
-                    ranges.append(r)
-                    continue
+            if normTarget.isEmpty {
+                if let range = findLiteral(target, in: ns, from: cursor) {
+                    ranges.append(range)
+                    cursor = range.location + range.length
+                } else {
+                    ranges.append(NSRange(location: NSNotFound, length: 0))
                 }
-                ranges.append(NSRange(location: NSNotFound, length: 0))
                 continue
             }
 
-            var matched = false
-            while tokenIdx < tokens.count {
-                let tok = tokens[tokenIdx]
-                tokenIdx += 1
-                let norm = SpeechText.normalizeToken(tok.text)
-                if norm == target || norm.hasPrefix(target) || target.hasPrefix(norm) {
-                    ranges.append(tok.range)
-                    matched = true
-                    break
-                }
-            }
-            if !matched {
+            if let (range, next) = findWord(normTarget, in: ns, from: cursor) {
+                ranges.append(range)
+                cursor = next
+            } else {
                 ranges.append(NSRange(location: NSNotFound, length: 0))
             }
         }
 
-        let hits = ranges.filter { $0.location != NSNotFound }.count
-        if hits < max(1, timestamps.count / 2) {
-            return buildFromTimestamps(timestamps)
-        }
-        return TextAlignmentResult(displayText: sanitized, ranges: ranges)
+        return TextAlignmentResult(displayText: text, ranges: ranges)
     }
 
-    private static func matchPunctuation(
-        _ punct: String,
-        in text: String,
-        tokens: [TextToken],
-        from tokenIdx: inout Int,
-        ranges: [NSRange]
-    ) -> NSRange? {
-        guard let ch = punct.unicodeScalars.first, punct.count == 1 else { return nil }
-        let searchFrom: String.Index
-        if let last = ranges.last(where: { $0.location != NSNotFound }),
-           let end = Range(last, in: text)?.upperBound {
-            searchFrom = end
-        } else if tokenIdx < tokens.count {
-            searchFrom = Range(tokens[tokenIdx].range, in: text)?.lowerBound ?? text.startIndex
-        } else {
-            searchFrom = text.startIndex
-        }
-        var i = searchFrom
-        while i < text.endIndex {
-            if text[i].unicodeScalars.first == ch {
-                let start = i
-                let end = text.index(after: i)
-                let r = NSRange(start..<end, in: text)
-                // advance tokenIdx past any token containing this position
-                while tokenIdx < tokens.count,
-                      tokens[tokenIdx].range.location + tokens[tokenIdx].range.length <= r.location + r.length {
-                    tokenIdx += 1
+    private static func findLiteral(_ literal: String, in text: NSString, from: Int) -> NSRange? {
+        guard !literal.isEmpty else { return nil }
+        let tail = NSRange(location: from, length: max(0, text.length - from))
+        let found = text.range(of: literal, options: [], range: tail)
+        return found.location == NSNotFound ? nil : found
+    }
+
+    private static func findWord(_ normTarget: String, in text: NSString, from: Int) -> (NSRange, Int)? {
+        var i = from
+        while i < text.length {
+            while i < text.length {
+                let ch = text.character(at: i)
+                if ch == 0x0A || ch == 0x0D {
+                    return nil
                 }
-                return r
+                if !CharacterSet.whitespaces.contains(UnicodeScalar(ch)!) {
+                    break
+                }
+                i += 1
             }
-            if !text[i].isWhitespace { break }
-            i = text.index(after: i)
+            if i >= text.length { return nil }
+
+            var j = i
+            while j < text.length {
+                let ch = text.character(at: j)
+                if CharacterSet.whitespaces.contains(UnicodeScalar(ch)!) {
+                    break
+                }
+                j += 1
+            }
+
+            let sliceRange = NSRange(location: i, length: j - i)
+            let slice = text.substring(with: sliceRange)
+            let normSlice = SpeechText.normalizeToken(slice)
+
+            if normSlice == normTarget
+                || normSlice.hasPrefix(normTarget)
+                || normTarget.hasPrefix(normSlice)
+            {
+                let matchLen = matchedUTF16Length(in: text, start: i, normTarget: normTarget) ?? (j - i)
+                let matched = NSRange(location: i, length: matchLen)
+                return (matched, i + matchLen)
+            }
+
+            i = j
         }
         return nil
     }
 
-    private static func tokenize(_ text: String) -> [TextToken] {
-        var tokens: [TextToken] = []
-        var i = text.startIndex
-        while i < text.endIndex {
-            while i < text.endIndex, text[i].isWhitespace, !text[i].isNewline { i = text.index(after: i) }
-            if i >= text.endIndex { break }
-
-            let start = i
-            while i < text.endIndex, !text[i].isWhitespace {
-                i = text.index(after: i)
+    /// Length in UTF-16 code units of the source prefix that spells `normTarget`.
+    private static func matchedUTF16Length(in text: NSString, start: Int, normTarget: String) -> Int? {
+        var norm = ""
+        var i = start
+        while i < text.length {
+            let ch = text.character(at: i)
+            if let scalar = UnicodeScalar(ch), CharacterSet.alphanumerics.contains(scalar) {
+                norm.append(Character(scalar).lowercased())
+                if norm.count > normTarget.count { return nil }
+                if norm == normTarget {
+                    return i - start + 1
+                }
+                if !normTarget.hasPrefix(norm) {
+                    return nil
+                }
             }
-            let range = NSRange(start..<i, in: text)
-            let slice = String(text[start..<i])
-            tokens.append(TextToken(text: slice, range: range))
+            i += 1
         }
-        return tokens
+        return norm == normTarget ? i - start : nil
     }
 
-    /// Fallback: display text built from Kokoro's own timestamp words (always in sync).
+    /// Fallback: display text built from Kokoro's own timestamp words (always in sync with audio).
     private static func buildFromTimestamps(_ timestamps: [WordTimestamp]) -> TextAlignmentResult {
         var display = ""
         var ranges: [NSRange] = []
-        for (idx, ts) in timestamps.enumerated() {
+        for ts in timestamps {
             let word = ts.word
             guard !word.isEmpty else {
                 ranges.append(NSRange(location: NSNotFound, length: 0))
@@ -200,7 +263,6 @@ enum TextAlignment {
             } else {
                 ranges.append(NSRange(location: NSNotFound, length: 0))
             }
-            _ = idx
         }
         return TextAlignmentResult(displayText: display, ranges: ranges)
     }

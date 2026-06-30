@@ -1,6 +1,7 @@
 import AVFoundation
 import AppKit
 import Foundation
+import NaturalLanguage
 import UniformTypeIdentifiers
 
 @MainActor
@@ -23,6 +24,11 @@ final class TTSViewModel: NSObject, ObservableObject {
     @Published var wordRanges: [NSRange] = []
     @Published var karaokeEnabled = false
     @Published private(set) var spokenText = ""
+    @Published private(set) var lastSynthesizedText = ""
+    @Published private(set) var suggestedAudioSlug = ""
+    @Published private(set) var suggestedAudioSummary = ""
+    @Published private(set) var suggestedAudioKind = ""
+    @Published var isDerivingTitle = false
 
     @Published var baseURLString: String {
         didSet { UserDefaults.standard.set(baseURLString, forKey: "kokoroBaseURL") }
@@ -32,12 +38,29 @@ final class TTSViewModel: NSObject, ObservableObject {
         didSet { UserDefaults.standard.set(apiKey, forKey: "kokoroAPIKey") }
     }
 
+    @Published var titleLLMBaseURL: String {
+        didSet { UserDefaults.standard.set(titleLLMBaseURL, forKey: "titleLLMBaseURL") }
+    }
+
+    @Published var titleLLMModel: String {
+        didSet { UserDefaults.standard.set(titleLLMModel, forKey: "titleLLMModel") }
+    }
+
+    @Published var titleLLMAPIKey: String {
+        didSet { UserDefaults.standard.set(titleLLMAPIKey, forKey: "titleLLMAPIKey") }
+    }
+
+    @Published var titleUseLLM: Bool {
+        didSet { UserDefaults.standard.set(titleUseLLM, forKey: "titleUseLLM") }
+    }
+
     private var audioPlayer: AVAudioPlayer?
     private var audioData: Data?
     private var wordTimestamps: [WordTimestamp] = []
     private var highlightTimer: Timer?
     private var progressTimer: Timer?
     private var generateTask: Task<Void, Never>?
+    private var titleTask: Task<Void, Never>?
 
     /// Karaoke disabled for very long passages (UI + alignment cost).
     static let karaokeMaxWords = 400
@@ -52,6 +75,10 @@ final class TTSViewModel: NSObject, ObservableObject {
         baseURLString = UserDefaults.standard.string(forKey: "kokoroBaseURL")
             ?? "http://alpha-old:8880/v1"
         apiKey = UserDefaults.standard.string(forKey: "kokoroAPIKey") ?? "not-needed"
+        titleLLMBaseURL = UserDefaults.standard.string(forKey: "titleLLMBaseURL") ?? ""
+        titleLLMModel = UserDefaults.standard.string(forKey: "titleLLMModel") ?? "llama3.2"
+        titleLLMAPIKey = UserDefaults.standard.string(forKey: "titleLLMAPIKey") ?? ""
+        titleUseLLM = UserDefaults.standard.object(forKey: "titleUseLLM") as? Bool ?? true
         super.init()
         Task { await refreshHealth() }
     }
@@ -163,18 +190,24 @@ final class TTSViewModel: NSObject, ObservableObject {
                 }.value
                 spokenText = alignment.displayText
                 wordRanges = alignment.ranges
+                // Keep editor text in sync when Kokoro normalizes spacing/punctuation.
+                if alignment.displayText != cleaned {
+                    text = alignment.displayText
+                }
             } else {
                 spokenText = cleaned
                 wordRanges = []
             }
 
+            lastSynthesizedText = spokenText.isEmpty ? cleaned : spokenText
+            deriveSuggestedTitle(from: lastSynthesizedText)
+
             karaokeEnabled = canKaraoke
             activeWordIndex = nil
 
-            // Play first — enable karaoke after the UI settles.
             try startPlayback(data: result.audio)
             if canKaraoke {
-                activeWordIndex = 0
+                syncWordHighlight(at: 0)
             }
 
             let elapsed = Date().timeIntervalSince(started)
@@ -240,11 +273,90 @@ final class TTSViewModel: NSObject, ObservableObject {
         guard let data = audioData else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [format.utType]
-        panel.nameFieldStringValue = "speech-\(selectedVoice).\(format.rawValue)"
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-            try? data.write(to: url)
+        panel.nameFieldStringValue = suggestedFilename()
+        panel.message = suggestedAudioSummary.isEmpty
+            ? "Save synthesized speech"
+            : suggestedAudioSummary
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url, let self else { return }
+            do {
+                try data.write(to: url)
+                try self.writeMetadata(alongside: url)
+            } catch {
+                Task { @MainActor in
+                    self.statusMessage = "Save failed: \(error.localizedDescription)"
+                    self.isError = true
+                }
+            }
         }
+    }
+
+    private func suggestedFilename() -> String {
+        if !suggestedAudioSlug.isEmpty {
+            return SpeechText.suggestedAudioFilename(slug: suggestedAudioSlug, format: format.rawValue)
+        }
+        return SpeechText.suggestedAudioFilename(
+            text: lastSynthesizedText,
+            voice: selectedVoice,
+            format: format.rawValue
+        )
+    }
+
+    private func writeMetadata(alongside audioURL: URL) throws {
+        let meta = AudioMetadata(
+            title: suggestedAudioSlug.isEmpty
+                ? SpeechText.filenameSlug(from: lastSynthesizedText)
+                : suggestedAudioSlug,
+            summary: suggestedAudioSummary.isEmpty
+                ? SpeechText.filenameSlug(from: lastSynthesizedText).replacingOccurrences(of: "-", with: " ")
+                : suggestedAudioSummary,
+            kind: suggestedAudioKind.isEmpty ? "other" : suggestedAudioKind,
+            voice: selectedVoice,
+            format: format.rawValue,
+            language: dominantLanguage(for: lastSynthesizedText),
+            sourceCharCount: lastSynthesizedText.count,
+            generatedAt: Date()
+        )
+        try meta.write(alongside: audioURL)
+    }
+
+    private func deriveSuggestedTitle(from text: String) {
+        titleTask?.cancel()
+        suggestedAudioSlug = ""
+        suggestedAudioSummary = ""
+        suggestedAudioKind = ""
+        isDerivingTitle = true
+
+        let config = TitleGeneratorConfig(
+            llmBaseURL: titleLLMBaseURL,
+            llmModel: titleLLMModel,
+            llmAPIKey: titleLLMAPIKey,
+            useLLM: titleUseLLM
+        )
+
+        titleTask = Task {
+            let title = await TitleGenerator.generate(from: text, config: config)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self.suggestedAudioSlug = title.slug
+                self.suggestedAudioSummary = title.summary
+                self.suggestedAudioKind = title.kind
+                self.isDerivingTitle = false
+                if !self.isGenerating, !self.isPlaying {
+                    self.statusMessage = "Title: \(title.slug)"
+                }
+            }
+        }
+    }
+
+    func applySuggestedLLMURL() {
+        titleLLMBaseURL = TitleGenerator.suggestedLLMURL(fromKokoro: baseURLString)
+    }
+
+    private func dominantLanguage(for text: String) -> String? {
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+        return recognizer.dominantLanguage?.rawValue
     }
 
     func seek(to time: TimeInterval) {
@@ -268,6 +380,7 @@ final class TTSViewModel: NSObject, ObservableObject {
             player.play()
             isPlaying = true
             startHighlightTimer()
+            syncWordHighlight(at: player.currentTime)
         } else if let data = audioData {
             try? startPlayback(data: data)
         }
@@ -333,20 +446,36 @@ final class TTSViewModel: NSObject, ObservableObject {
     }
 
     private func syncWordHighlight(at time: TimeInterval) {
-        guard karaokeEnabled, isPlaying, !wordTimestamps.isEmpty else { return }
+        guard karaokeEnabled, !wordTimestamps.isEmpty else { return }
 
-        let idx: Int?
-        if let found = wordTimestamps.firstIndex(where: { time >= $0.startTime - 0.02 && time < $0.endTime }) {
-            idx = found
+        let rawIdx: Int?
+        if let found = wordTimestamps.firstIndex(where: { time >= $0.startTime - 0.05 && time < $0.endTime + 0.02 }) {
+            rawIdx = found
         } else if time >= (wordTimestamps.last?.endTime ?? 0) {
-            idx = nil
+            rawIdx = nil
+        } else if time <= (wordTimestamps.first?.startTime ?? 0) {
+            rawIdx = 0
         } else {
             return
         }
 
+        let idx = rawIdx.flatMap { nearestMappedIndex(for: $0) }
         guard idx != activeWordIndex else { return }
-        guard idx == nil || (idx! < wordRanges.count && wordRanges[idx!].location != NSNotFound) else { return }
         activeWordIndex = idx
+    }
+
+    private func nearestMappedIndex(for timestampIndex: Int) -> Int? {
+        guard timestampIndex < wordRanges.count else { return nil }
+        if wordRanges[timestampIndex].location != NSNotFound {
+            return timestampIndex
+        }
+        if let next = (timestampIndex ..< wordRanges.count).first(where: { wordRanges[$0].location != NSNotFound }) {
+            return next
+        }
+        if let prev = (0 ..< timestampIndex).reversed().first(where: { wordRanges[$0].location != NSNotFound }) {
+            return prev
+        }
+        return nil
     }
 
     var hasAudio: Bool { audioData != nil }
