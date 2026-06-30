@@ -59,15 +59,22 @@ cp .env.example .env
 
 > `.env` is gitignored — your key never gets committed.
 
-**2. Run it in Docker:**
+**2. Run it in Docker (Tailscale-native via [tsdproxy](https://github.com/almeidapaulopt/tsdproxy)):**
 
 ```bash
 docker compose up --build -d
 ```
 
-Open **http://localhost:8090**. Create a project, upload some page photos, and
-watch them turn into a read-along book. Data (database, uploaded images, cached
-audio) lives in the `invtts-data` Docker volume and survives rebuilds.
+The compose file joins the shared `isolated_nw` network and carries `tsdproxy.*`
+labels, so tsdproxy publishes Aloud as its own Tailscale node — reachable at
+**`https://aloud.<your-tailnet>.ts.net`** with no published host port. Funnel is
+off by default (private tailnet only); flip `tsdproxy.funnel` to `"true"` to
+expose it publicly.
+
+Data (database, uploaded images, cached audio) lives in the `invtts-data` Docker
+volume and survives rebuilds. To run without Tailscale, drop the `networks`/
+`labels` blocks and add a `ports: ["8090:8080"]` mapping instead, then open
+`http://localhost:8090`.
 
 **Or run the published image** from Docker Hub
 ([`princeamd/aloud`](https://hub.docker.com/r/princeamd/aloud)) — no source
