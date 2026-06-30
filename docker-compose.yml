@@ -1,17 +1,32 @@
-# invtts runs locally; point at Kokoro on alpha-old (Tailscale IP for in-container reachability).
+# Aloud — Tailscale-native via tsdproxy.
+# tsdproxy watches the Docker socket and publishes any container on the shared
+# `isolated_nw` network that carries `tsdproxy.*` labels as its own Tailscale
+# node — here reachable at https://aloud.<your-tailnet>.ts.net (no host port,
+# no published port needed). See https://github.com/almeidapaulopt/tsdproxy.
+#
 # Secrets (GEMINI_API_KEY) come from a local .env file — see .env.example.
+networks:
+  isolated_nw:
+    external: true
+
 services:
-  invtts:
+  aloud:
     image: princeamd/aloud:latest
     build: .
-    ports:
-      - "8090:8080"
+    container_name: aloud
+    networks:
+      - isolated_nw
     environment:
       KOKORO_BASE_URL: http://100.89.61.7:8880/v1
       GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
     volumes:
       - invtts-data:/data
+    labels:
+      tsdproxy.enable: "true"
+      tsdproxy.name: "aloud"
+      tsdproxy.container_port: "8080"
+      tsdproxy.funnel: "false"
     restart: unless-stopped
 
 volumes:
