@@ -27,6 +27,7 @@ services:
       tsdproxy.name: "aloud"
       tsdproxy.container_port: "8080"
       tsdproxy.funnel: "false"
+      tsdproxy.authkey: ${TSDPROXY_AUTHKEY:?set TSDPROXY_AUTHKEY in .env}
     restart: unless-stopped
 
 volumes:

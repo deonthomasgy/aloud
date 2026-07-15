@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"time"
 )
+
+const maxPageUploadBytes = 100 << 20
 
 // --- Projects CRUD ---
 
@@ -87,7 +90,7 @@ func (s *server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// --- Page upload (images or text) ---
+// --- Page upload (images, PDFs, or text) ---
 
 func (s *server) handleUploadPages(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "id")
@@ -99,13 +102,24 @@ func (s *server) handleUploadPages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Up to ~64MB of uploaded images per request.
-	if err := r.ParseMultipartForm(64 << 20); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "could not parse upload: "+err.Error())
+	r.Body = http.MaxBytesReader(w, r.Body, maxPageUploadBytes)
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		status := http.StatusBadRequest
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeJSONError(w, status, "could not parse upload: "+err.Error())
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 
 	created := 0
+	defer func() {
+		if created > 0 {
+			go s.ocrPendingPages(projectID)
+		}
+	}()
 
 	// Raw text → one page, split into paragraphs immediately (no OCR).
 	if text := strings.TrimSpace(r.FormValue("text")); text != "" {
@@ -152,16 +166,103 @@ func (s *server) handleUploadPages(w http.ResponseWriter, r *http.Request) {
 		created++
 	}
 
+	// PDF files → rasterized PNG pages, then the same OCR path as images.
+	for _, fh := range r.MultipartForm.File["pdf"] {
+		f, err := fh.Open()
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "could not open PDF: "+err.Error())
+			return
+		}
+		data, readErr := io.ReadAll(io.LimitReader(f, maxPDFBytes+1))
+		closeErr := f.Close()
+		if readErr != nil {
+			writeJSONError(w, http.StatusBadRequest, "could not read PDF: "+readErr.Error())
+			return
+		}
+		if closeErr != nil {
+			writeJSONError(w, http.StatusBadRequest, "could not close PDF: "+closeErr.Error())
+			return
+		}
+		if len(data) > maxPDFBytes {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("PDF exceeds the %d MB limit", maxPDFBytes>>20))
+			return
+		}
+
+		n, err := s.addPDFPages(r.Context(), projectID, data)
+		created += n
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("could not add %q: %v", fh.Filename, err))
+			return
+		}
+	}
+
 	if created == 0 {
-		writeJSONError(w, http.StatusBadRequest, "no text or images provided")
+		writeJSONError(w, http.StatusBadRequest, "no text, images, or PDFs provided")
 		return
 	}
 
-	// Kick off OCR for any pending pages of this project.
-	go s.ocrPendingPages(projectID)
-
 	p, _ := s.store.getProject(projectID)
 	writeJSON(w, http.StatusAccepted, p)
+}
+
+func (s *server) addPDFPages(ctx context.Context, projectID int64, data []byte) (int, error) {
+	renderCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	rendered, err := rasterizePDF(renderCtx, data)
+	if err != nil {
+		return 0, err
+	}
+	defer rendered.Close()
+
+	uploadDir := filepath.Join(s.cfg.dataDir, "uploads", strconv.FormatInt(projectID, 10))
+	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+		return 0, fmt.Errorf("create upload directory: %w", err)
+	}
+
+	created := 0
+	for pageIndex, sourcePath := range rendered.paths {
+		source, err := os.Open(sourcePath)
+		if err != nil {
+			return created, fmt.Errorf("open rendered page %d: %w", pageIndex+1, err)
+		}
+
+		destination, err := os.CreateTemp(uploadDir, "pdf-page-*.png")
+		if err != nil {
+			source.Close()
+			return created, fmt.Errorf("create page image %d: %w", pageIndex+1, err)
+		}
+		destinationPath := destination.Name()
+
+		_, copyErr := io.Copy(destination, source)
+		sourceCloseErr := source.Close()
+		destinationCloseErr := destination.Close()
+		if copyErr != nil || sourceCloseErr != nil || destinationCloseErr != nil {
+			_ = os.Remove(destinationPath)
+			switch {
+			case copyErr != nil:
+				err = copyErr
+			case sourceCloseErr != nil:
+				err = sourceCloseErr
+			default:
+				err = destinationCloseErr
+			}
+			return created, fmt.Errorf("save page image %d: %w", pageIndex+1, err)
+		}
+
+		position, err := s.store.nextPagePosition(projectID)
+		if err != nil {
+			_ = os.Remove(destinationPath)
+			return created, fmt.Errorf("position page %d: %w", pageIndex+1, err)
+		}
+		if _, err := s.store.createPage(projectID, position, destinationPath, "image", "pending"); err != nil {
+			_ = os.Remove(destinationPath)
+			return created, fmt.Errorf("create page %d: %w", pageIndex+1, err)
+		}
+		created++
+	}
+
+	return created, nil
 }
 
 // ocrPendingPages OCRs every pending page of a project sequentially, then

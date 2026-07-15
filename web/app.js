@@ -552,10 +552,10 @@ function editParagraph(node, para) {
 
 // ---------- upload modal ----------
 function openUpload() {
-  const fileInput = el("input", { type: "file", accept: "image/*", multiple: "", class: "hidden" });
+  const fileInput = el("input", { type: "file", accept: "image/*,.pdf,application/pdf", multiple: "", class: "hidden" });
   const dz = el("div", { class: "dropzone", onclick: () => fileInput.click() },
-    el("div", {}, "📷 Drop page photos here, or click to choose"),
-    el("div", { class: "hint" }, "You can select many at once — order is detected from page numbers."));
+    el("div", {}, "Drop page photos or PDFs here, or click to choose"),
+    el("div", { class: "hint" }, "PDFs are split into pages; photo order is detected from page numbers."));
   dz.addEventListener("dragover", e => { e.preventDefault(); dz.classList.add("drag"); });
   dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
   dz.addEventListener("drop", e => { e.preventDefault(); dz.classList.remove("drag"); doUpload(e.dataTransfer.files, null); });
@@ -581,9 +581,15 @@ function openUpload() {
   async function doUpload(files, text) {
     const fd = new FormData();
     let any = false;
-    if (files && files.length) { for (const f of files) fd.append("images", f); any = true; }
+    if (files && files.length) {
+      for (const f of files) {
+        const isPDF = f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
+        fd.append(isPDF ? "pdf" : "images", f);
+      }
+      any = true;
+    }
     if (text && text.trim()) { fd.append("text", text.trim()); any = true; }
-    if (!any) { st.textContent = "Choose images or enter text first."; st.classList.add("error"); return; }
+    if (!any) { st.textContent = "Choose images or PDFs, or enter text first."; st.classList.add("error"); return; }
     st.textContent = "Uploading…"; st.classList.remove("error");
     try {
       const p = await api("POST", "/api/projects/" + state.project.id + "/pages", fd, true);

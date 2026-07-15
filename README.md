@@ -144,7 +144,7 @@ macos/           Native SwiftUI app (earlier standalone TTS client)
 ## API
 
 - `GET /api/projects` · `POST /api/projects` · `GET /api/projects/{id}` · `DELETE /api/projects/{id}`
-- `POST /api/projects/{id}/pages` — multipart image(s) or `text`; OCRs async.
+- `POST /api/projects/{id}/pages` — multipart `images`, `pdf`, or `text`; PDFs are split into pages and OCR runs async.
 - `POST /api/projects/{id}/reorder` · `POST /api/projects/{id}/autoorder`
 - `PUT /api/paragraphs/{id}` — edit text (clears cached audio).
 - `POST /api/paragraphs/{id}/speech` — lazy synth, returns audio URL + timestamps.
