@@ -5,10 +5,15 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"math"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // WordTS is a single word with its spoken start/end time in seconds.
@@ -44,6 +49,16 @@ type captionedResponse struct {
 	Timestamps []rawTimestamp `json:"timestamps"`
 }
 
+type upstreamHTTPError struct {
+	endpoint string
+	status   int
+	body     string
+}
+
+func (e *upstreamHTTPError) Error() string {
+	return fmt.Sprintf("%s returned %d: %s", e.endpoint, e.status, e.body)
+}
+
 // synthesizeCaptioned calls Kokoro's captioned endpoint and returns audio bytes
 // plus word timestamps. On any failure it falls back to plain speech (no timestamps).
 func synthesizeCaptioned(ctx context.Context, cfg config, client *http.Client, text, voice, format string, speed float64) ([]byte, []WordTS, error) {
@@ -51,12 +66,28 @@ func synthesizeCaptioned(ctx context.Context, cfg config, client *http.Client, t
 	if err == nil {
 		return audio, ts, nil
 	}
+
+	if ctx.Err() == nil && retryableCaptionError(err) {
+		timer := time.NewTimer(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+			retryAudio, retryTS, retryErr := captioned(ctx, cfg, client, text, voice, format, speed)
+			if retryErr == nil {
+				return retryAudio, retryTS, nil
+			}
+			err = fmt.Errorf("%v; retry failed: %w", err, retryErr)
+		}
+	}
+
 	// Fallback: plain /v1/audio/speech (existing proxy path), no timestamps.
 	audio, ferr := plainSpeech(ctx, cfg, client, text, voice, format, speed)
 	if ferr != nil {
 		return nil, nil, fmt.Errorf("captioned failed (%v) and fallback failed: %w", err, ferr)
 	}
-	return audio, nil, nil
+	log.Printf("captioned speech unavailable; using plain speech without word timestamps: %v", err)
+	return audio, []WordTS{}, nil
 }
 
 func captioned(ctx context.Context, cfg config, client *http.Client, text, voice, format string, speed float64) ([]byte, []WordTS, error) {
@@ -88,7 +119,11 @@ func captioned(ctx context.Context, cfg config, client *http.Client, text, voice
 
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("captioned_speech returned %d: %s", resp.StatusCode, truncate(string(raw), 200))
+		return nil, nil, &upstreamHTTPError{
+			endpoint: "captioned_speech",
+			status:   resp.StatusCode,
+			body:     truncate(string(raw), 200),
+		}
 	}
 
 	var cr captionedResponse
@@ -100,16 +135,68 @@ func captioned(ctx context.Context, cfg config, client *http.Client, text, voice
 		return nil, nil, fmt.Errorf("captioned_speech: bad base64 audio: %w", err)
 	}
 
-	ts := make([]WordTS, 0, len(cr.Timestamps))
-	for _, r := range cr.Timestamps {
+	return audio, parseWordTimestamps(cr.Timestamps), nil
+}
+
+func parseWordTimestamps(raw []rawTimestamp) []WordTS {
+	ts := make([]WordTS, 0, len(raw))
+	for _, r := range raw {
 		start := firstNonNil(r.StartTime, r.Start)
 		end := firstNonNil(r.EndTime, r.End)
-		if end == 0 {
-			end = start
-		}
 		ts = append(ts, WordTS{Word: r.Word, StartTime: start, EndTime: end})
 	}
-	return audio, ts, nil
+	return normalizeWordTimestamps(ts)
+}
+
+// normalizeWordTimestamps repairs malformed or incomplete timings from Kokoro
+// and cached responses while preserving the engine's token order.
+func normalizeWordTimestamps(timestamps []WordTS) []WordTS {
+	if len(timestamps) == 0 {
+		return []WordTS{}
+	}
+
+	out := append([]WordTS(nil), timestamps...)
+	previousStart := 0.0
+	for i := range out {
+		if math.IsNaN(out[i].StartTime) || math.IsInf(out[i].StartTime, 0) || out[i].StartTime < 0 {
+			out[i].StartTime = previousStart
+		}
+		if out[i].StartTime < previousStart {
+			out[i].StartTime = previousStart
+		}
+		if math.IsNaN(out[i].EndTime) || math.IsInf(out[i].EndTime, 0) {
+			out[i].EndTime = out[i].StartTime
+		}
+		previousStart = out[i].StartTime
+	}
+
+	for i := range out {
+		var nextStart float64
+		hasNext := i+1 < len(out)
+		if hasNext {
+			nextStart = out[i+1].StartTime
+		}
+		if out[i].EndTime <= out[i].StartTime {
+			if hasNext && nextStart > out[i].StartTime {
+				out[i].EndTime = nextStart
+			} else {
+				out[i].EndTime = out[i].StartTime + 0.25
+			}
+		}
+		if hasNext && nextStart > out[i].StartTime && out[i].EndTime > nextStart {
+			out[i].EndTime = nextStart
+		}
+	}
+	return out
+}
+
+func retryableCaptionError(err error) bool {
+	var upstreamErr *upstreamHTTPError
+	if errors.As(err, &upstreamErr) {
+		return upstreamErr.status == http.StatusTooManyRequests || upstreamErr.status >= http.StatusInternalServerError
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr)
 }
 
 // plainSpeech posts to /v1/audio/speech and returns raw audio bytes.

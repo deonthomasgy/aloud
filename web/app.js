@@ -3,6 +3,7 @@
 // ---------- helpers ----------
 const app = document.getElementById("app");
 const player = document.getElementById("player");
+const highlighter = window.AloudHighlight;
 const el = (tag, attrs = {}, ...kids) => {
   const n = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -621,6 +622,7 @@ function maybePoll() {
 // top of the next) the pieces are joined into one unit and synthesized as a
 // single clip — so it reads continuously with no pause.
 let play = { paraId: null, unitIdx: -1, mode: "page", words: [], raf: 0 };
+let activeHighlightSpan = null;
 // Persistent reading mode chosen by the Page / All-pages toggle. Clicking any
 // paragraph continues in this mode (default: read to the end of the page).
 let readMode = "page";
@@ -710,6 +712,7 @@ function prefetchAhead(units, uIdx) {
 
 function stopPlayback() {
   if (play.raf) cancelAnimationFrame(play.raf);
+  clearActiveHighlight();
   try { player.pause(); } catch (_) {}
   const node = document.querySelector(".para.active");
   if (node) resetParaNode(node);
@@ -749,6 +752,8 @@ async function startPlay(paraId, mode, force) {
 
 async function playUnit(units, uIdx, force) {
   if (play.raf) cancelAnimationFrame(play.raf);
+  play.raf = 0;
+  clearActiveHighlight();
   const prev = document.querySelector(".para.active");
   if (prev) resetParaNode(prev);
 
@@ -788,45 +793,109 @@ async function playUnit(units, uIdx, force) {
   catch (e) { if (btn) btn.innerHTML = ICON.play; node.classList.remove("active"); console.error(e); return; }
   if (play.unitIdx !== uIdx) return; // superseded
 
-  buildWords(node, data.timestamps || []);
+  player.src = data.audioUrl;
+  try { await waitForAudioMetadata(); }
+  catch (e) { if (btn) btn.innerHTML = ICON.play; node.classList.remove("active"); console.error(e); return; }
+  if (play.unitIdx !== uIdx) return; // superseded while audio loaded
+
+  buildWords(node, data.timestamps || [], player.duration);
   if (btn) btn.innerHTML = ICON.pause;
   node.classList.add("playing");
-  player.src = data.audioUrl;
-  try { await player.play(); } catch (_) {}
+  try { await player.play(); }
+  catch (e) {
+    if (btn) btn.innerHTML = ICON.play;
+    node.classList.remove("playing");
+    console.error(e);
+    return;
+  }
+  if (play.unitIdx !== uIdx) return;
   setPlaybarIcon(true);
   loopHighlight();
   prefetchAhead(units, uIdx);
 }
 
-function buildWords(node, timestamps) {
-  const c = node.querySelector(".ptext");
-  if (!c.dataset.plain) c.dataset.plain = c.textContent;
-  play.words = [];
-  if (!timestamps.length) { c.textContent = c.dataset.plain; return; }
-  // Display the original words (preserving emphasis CAPS / punctuation) but drive
-  // highlight timing from the engine's timestamps. They align 1:1 unless the
-  // tokenization differs, in which case we fall back to the spoken words.
-  const orig = c.dataset.plain.split(/\s+/).filter(Boolean);
-  const useOrig = orig.length === timestamps.length;
-  c.innerHTML = "";
-  timestamps.forEach((t, i) => {
-    const s = el("span", { class: "word" }, useOrig ? orig[i] : t.word);
-    c.append(s);
-    if (i < timestamps.length - 1) c.append(document.createTextNode(" "));
-    play.words.push({ span: s, start: t.start_time, end: t.end_time });
+function waitForAudioMetadata() {
+  if (player.readyState >= 1 && Number.isFinite(player.duration)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const loaded = () => { cleanup(); resolve(); };
+    const failed = () => { cleanup(); reject(new Error("Could not load speech audio")); };
+    const cleanup = () => {
+      player.removeEventListener("loadedmetadata", loaded);
+      player.removeEventListener("error", failed);
+    };
+    player.addEventListener("loadedmetadata", loaded);
+    player.addEventListener("error", failed);
   });
 }
 
-function loopHighlight() {
-  const tick = () => {
-    if (player.paused || player.ended) return;
-    const t = player.currentTime;
-    let active = -1;
-    for (let i = 0; i < play.words.length; i++) {
-      if (t >= play.words[i].start) active = i;
-      if (t < (play.words[i].end || play.words[i].start + 0.3)) break;
+function buildWords(node, timestamps, duration) {
+  const c = node.querySelector(".ptext");
+  if (!c.dataset.plain) c.dataset.plain = c.textContent;
+  const original = c.dataset.plain;
+  let timings = highlighter.repairTimings(timestamps);
+  if (highlighter.needsEstimatedTimings(timings, duration)) {
+    timings = highlighter.estimateTimings(original, duration);
+  }
+  const aligned = highlighter.alignText(original, timings);
+  const spans = new Array(timings.length).fill(null);
+
+  c.innerHTML = "";
+  let cursor = 0;
+  aligned.ranges.forEach((range, index) => {
+    if (!range || range.start < cursor || range.end <= range.start) return;
+    if (range.start > cursor) c.append(document.createTextNode(aligned.displayText.slice(cursor, range.start)));
+    const span = el("span", { class: "word" }, aligned.displayText.slice(range.start, range.end));
+    c.append(span);
+    spans[index] = span;
+    cursor = range.end;
+  });
+  if (cursor < aligned.displayText.length) {
+    c.append(document.createTextNode(aligned.displayText.slice(cursor)));
+  }
+  play.words = timings.map((timing, index) => ({ ...timing, span: spans[index] }));
+}
+
+function mappedHighlightSpan(index) {
+  if (index < 0 || index >= play.words.length) return null;
+  if (play.words[index].span) return play.words[index].span;
+  for (let distance = 1; distance < play.words.length; distance++) {
+    if (index + distance < play.words.length && play.words[index + distance].span) {
+      return play.words[index + distance].span;
     }
-    play.words.forEach((w, i) => w.span.classList.toggle("spoken", i === active));
+    if (index - distance >= 0 && play.words[index - distance].span) {
+      return play.words[index - distance].span;
+    }
+  }
+  return null;
+}
+
+function setActiveHighlight(index) {
+  const next = mappedHighlightSpan(index);
+  if (next === activeHighlightSpan) return;
+  if (activeHighlightSpan) activeHighlightSpan.classList.remove("spoken");
+  activeHighlightSpan = next;
+  if (activeHighlightSpan) activeHighlightSpan.classList.add("spoken");
+}
+
+function clearActiveHighlight() {
+  if (activeHighlightSpan) activeHighlightSpan.classList.remove("spoken");
+  activeHighlightSpan = null;
+}
+
+function syncHighlight() {
+  const index = highlighter.activeIndex(play.words, player.currentTime, player.duration);
+  setActiveHighlight(index);
+}
+
+function loopHighlight() {
+  if (play.raf) cancelAnimationFrame(play.raf);
+  const tick = () => {
+    if (player.paused || player.ended) {
+      play.raf = 0;
+      if (player.ended) clearActiveHighlight();
+      return;
+    }
+    syncHighlight();
     play.raf = requestAnimationFrame(tick);
   };
   play.raf = requestAnimationFrame(tick);
@@ -835,9 +904,12 @@ function loopHighlight() {
 function pauseToggle() {
   if (play.unitIdx < 0) return;
   const active = document.querySelector(".para.active");
-  if (player.paused) { player.play(); setPlaybarIcon(true); loopHighlight();
-    if (active) { active.classList.add("playing"); active.querySelector(".play").innerHTML = ICON.pause; } }
-  else { player.pause(); setPlaybarIcon(false);
+  if (player.paused) {
+    player.play().then(() => loopHighlight()).catch(console.error);
+    setPlaybarIcon(true);
+    if (active) { active.classList.add("playing"); active.querySelector(".play").innerHTML = ICON.pause; }
+  }
+  else { player.pause(); if (play.raf) cancelAnimationFrame(play.raf); play.raf = 0; setPlaybarIcon(false);
     if (active) { active.classList.remove("playing"); active.querySelector(".play").innerHTML = ICON.play; } }
 }
 
@@ -851,6 +923,7 @@ function step(dir) {
 }
 
 player.addEventListener("ended", () => {
+  clearActiveHighlight();
   const n = document.querySelector(".para.active .play"); if (n) n.innerHTML = ICON.play;
   if (play.mode === "single") { stopPlayback(); return; }
   const units = buildUnits(flat());
@@ -861,6 +934,7 @@ player.addEventListener("ended", () => {
   if (play.mode === "page" && next.entries[0].pageId !== cur.entries[0].pageId) { stopPlayback(); return; }
   playUnit(units, play.unitIdx + 1, false);
 });
+player.addEventListener("seeked", syncHighlight);
 
 function curVoice() { const s = document.getElementById("voice"); return s ? s.value : undefined; }
 function curSpeed() { const s = document.getElementById("pspeed"); return s ? parseFloat(s.value) : undefined; }

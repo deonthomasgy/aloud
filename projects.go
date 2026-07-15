@@ -498,6 +498,7 @@ func (s *server) handleParagraphSpeech(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadGateway, "synthesis failed: "+err.Error())
 		return
 	}
+	timestamps = normalizeWordTimestamps(timestamps)
 
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "could not create audio dir")
@@ -560,6 +561,7 @@ func (s *server) handleSpeak(w http.ResponseWriter, r *http.Request) {
 			if raw, err := os.ReadFile(tsPath); err == nil {
 				var ts []WordTS
 				_ = json.Unmarshal(raw, &ts)
+				ts = normalizeWordTimestamps(ts)
 				writeJSON(w, http.StatusOK, speechResponse{AudioURL: "/api/audio/" + name, Timestamps: ts})
 				return
 			}
@@ -573,6 +575,7 @@ func (s *server) handleSpeak(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadGateway, "synthesis failed: "+err.Error())
 		return
 	}
+	timestamps = normalizeWordTimestamps(timestamps)
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "could not create audio dir")
 		return
@@ -595,7 +598,7 @@ func (s *server) cachedTimestamps(paragraphID int64) []WordTS {
 	if err := json.Unmarshal([]byte(raw), &ts); err != nil {
 		return []WordTS{}
 	}
-	return ts
+	return normalizeWordTimestamps(ts)
 }
 
 // handleAudio serves a cached audio file by name.
