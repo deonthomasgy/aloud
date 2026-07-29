@@ -6,18 +6,31 @@ import (
 	"unicode"
 )
 
-var parenthesizedRomanMarker = regexp.MustCompile(`\(([iIvVxX]+)\)`)
+var (
+	parenthesizedRomanMarker = regexp.MustCompile(`\(([iIvVxX]+)\)`)
+	intraWordBacktick        = regexp.MustCompile("([\\p{L}\\p{N}])`([\\p{L}])")
+	markdownImage            = regexp.MustCompile(`!\[([^\]]*)\]\([^)]*\)`)
+	markdownLink             = regexp.MustCompile(`\[([^\]]+)\]\([^)]*\)`)
+	inlineCode               = regexp.MustCompile("`([^`\\n]+)`")
+	markdownLinePrefix       = regexp.MustCompile(`^[ \t]{0,3}(#{1,6}[ \t]+|>[ \t]?|[-+*][ \t]+)`)
+	numericRange             = regexp.MustCompile(`(\d)[ \t]*[–—][ \t]*(\d)`)
+	numericRatio             = regexp.MustCompile(`(\d)[ \t]*:[ \t]*(\d)`)
+	atMention                = regexp.MustCompile(`@([\p{L}\p{N}_-]+)`)
+	spaceBeforePunctuation   = regexp.MustCompile(`[ \t]+([,.;:!?])`)
+)
 
 // normalizeForSpeech rewrites text so a TTS engine pronounces it naturally.
 //
-// Kokoro (like most OpenAI-compatible engines) treats an ALL-CAPS word as an
-// acronym and spells it out letter by letter. Books use all caps for *emphasis*
-// ("she was NEVER coming back"), which should be read as a normal word. We
-// lower-case all-caps words that look like real words (contain a vowel), while
-// leaving consonant-only acronyms (FBI, NBC) and single letters (I, A) alone so
-// they are still spelled when that is actually intended.
+// The stored text remains unchanged: this function only prepares the copy sent
+// to Kokoro. Besides fixing ALL-CAPS emphasis and Roman list markers, it removes
+// visual Markdown syntax and turns code-like identifiers into spoken words.
 func normalizeForSpeech(text string) string {
+	text = normalizeSpeechUnicode(text)
+	text = intraWordBacktick.ReplaceAllString(text, "$1'$2")
+	text = simplifyMarkdownForSpeech(text)
+	text = rewriteSpeechSymbols(text)
 	text = rewriteRomanListMarkers(text)
+	text = collapseSpeechWhitespace(text)
 
 	var b strings.Builder
 	b.Grow(len(text))
@@ -39,6 +52,137 @@ func normalizeForSpeech(text string) string {
 	}
 	flush()
 	return b.String()
+}
+
+func normalizeSpeechUnicode(text string) string {
+	replacer := strings.NewReplacer(
+		"\r\n", "\n",
+		"\r", "\n",
+		"\u00a0", " ",
+		"\u200b", "",
+		"\ufeff", "",
+		"\u2018", "'",
+		"\u2019", "'",
+		"\u201b", "'",
+		"\u201c", "\"",
+		"\u201d", "\"",
+		"\u2026", "...",
+	)
+	return replacer.Replace(text)
+}
+
+// simplifyMarkdownForSpeech removes formatting while preserving what a reader
+// can see. Fenced and inline code are retained, but their identifiers are made
+// pronounceable rather than being omitted.
+func simplifyMarkdownForSpeech(text string) string {
+	text = markdownImage.ReplaceAllString(text, "$1")
+	text = markdownLink.ReplaceAllString(text, "$1")
+
+	lines := strings.Split(text, "\n")
+	inFence := false
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			line = naturalizeCodeText(line)
+		} else {
+			line = markdownLinePrefix.ReplaceAllString(line, "")
+			line = inlineCode.ReplaceAllStringFunc(line, func(code string) string {
+				return naturalizeCodeText(code[1 : len(code)-1])
+			})
+		}
+		kept = append(kept, line)
+	}
+
+	text = strings.Join(kept, "\n")
+	text = strings.NewReplacer(
+		"**", "",
+		"__", "",
+		"~~", "",
+		"*", "",
+		"_", " ",
+		"`", "",
+	).Replace(text)
+	return text
+}
+
+func naturalizeCodeText(text string) string {
+	text = strings.NewReplacer(
+		"!=", " does not equal ",
+		">=", " greater than or equal to ",
+		"<=", " less than or equal to ",
+		"==", " equals ",
+		"&&", " and ",
+		"||", " or ",
+		"::", " ",
+		"->", " ",
+		"=>", " ",
+		"/", " ",
+		"\\", " ",
+		"_", " ",
+		".", " ",
+		"+", " plus ",
+		"=", " equals ",
+	).Replace(text)
+
+	runes := []rune(text)
+	var b strings.Builder
+	b.Grow(len(text) + len(text)/8)
+	for i, r := range runes {
+		if i > 0 && unicode.IsUpper(r) {
+			previous := runes[i-1]
+			nextIsLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
+			if unicode.IsLower(previous) || unicode.IsDigit(previous) ||
+				(unicode.IsUpper(previous) && nextIsLower) {
+				b.WriteByte(' ')
+			}
+		}
+		b.WriteRune(r)
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+func rewriteSpeechSymbols(text string) string {
+	text = strings.ReplaceAll(text, "&amp;", "&")
+	text = numericRange.ReplaceAllString(text, "$1 to $2")
+	text = numericRatio.ReplaceAllString(text, "$1 to $2")
+	text = atMention.ReplaceAllString(text, "$1")
+	return strings.NewReplacer(
+		"→", ", ",
+		"⇒", ", ",
+		"➜", ", ",
+		"➔", ", ",
+		"->", ", ",
+		"=>", ", ",
+		"&", " and ",
+	).Replace(text)
+}
+
+func collapseSpeechWhitespace(text string) string {
+	lines := strings.Split(text, "\n")
+	cleaned := make([]string, 0, len(lines))
+	previousBlank := true
+	for _, line := range lines {
+		line = strings.Join(strings.Fields(line), " ")
+		line = spaceBeforePunctuation.ReplaceAllString(line, "$1")
+		if line == "" {
+			if !previousBlank {
+				cleaned = append(cleaned, "")
+			}
+			previousBlank = true
+			continue
+		}
+		cleaned = append(cleaned, line)
+		previousBlank = false
+	}
+	for len(cleaned) > 0 && cleaned[len(cleaned)-1] == "" {
+		cleaned = cleaned[:len(cleaned)-1]
+	}
+	return strings.Join(cleaned, "\n")
 }
 
 // rewriteRomanListMarkers makes legal-list markers predictable for TTS:

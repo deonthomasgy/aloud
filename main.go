@@ -244,7 +244,7 @@ func (s *server) handleTTS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.Text = strings.TrimSpace(req.Text)
+	req.Text = normalizeForSpeech(req.Text)
 	if req.Text == "" {
 		writeJSONError(w, http.StatusBadRequest, "text is empty")
 		return

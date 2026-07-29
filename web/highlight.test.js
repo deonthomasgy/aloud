@@ -57,6 +57,38 @@ test("aligns separately spoken acronym letters", () => {
   assert.equal(text.slice(aligned.ranges[2].start, aligned.ranges[2].end), "S");
 });
 
+test("aligns naturalized identifiers while preserving markdown display text", () => {
+  const text = "**Stages:** `self_assessment` → `peer_review`; `PerformanceAuthorizationService::employeeCanAssessAs`.";
+  const aligned = alignText(text, [
+    { word: "Stages" }, { word: ":" },
+    { word: "self" }, { word: "assessment" }, { word: "," },
+    { word: "peer" }, { word: "review" }, { word: ";" },
+    { word: "Performance" }, { word: "Authorization" }, { word: "Service" },
+    { word: "employee" }, { word: "Can" }, { word: "Assess" }, { word: "As" },
+    { word: "." },
+  ]);
+
+  assert.equal(aligned.displayText, text);
+  assert.equal(aligned.fallback, false);
+  assert.equal(text.slice(aligned.ranges[2].start, aligned.ranges[2].end), "self");
+  assert.equal(text.slice(aligned.ranges[3].start, aligned.ranges[3].end), "assessment");
+  assert.equal(aligned.ranges[4], null); // Spoken pause replaces the source arrow.
+});
+
+test("keeps alignment when speech expands symbols and numeric ranges", () => {
+  const text = "Read `REPOS/workforce/app/Performance` & rate it 1–5.";
+  const aligned = alignText(text, [
+    { word: "repos" }, { word: "workforce" }, { word: "app" }, { word: "Performance" },
+    { word: "and" }, { word: "rate" }, { word: "it" },
+    { word: "1" }, { word: "to" }, { word: "5" }, { word: "." },
+  ]);
+
+  assert.equal(aligned.displayText, text);
+  assert.equal(aligned.fallback, false);
+  assert.equal(aligned.ranges[4], null); // "and" is spoken for the ampersand.
+  assert.equal(aligned.ranges[8], null); // "to" is spoken for the range dash.
+});
+
 test("aligns spoken numbers to parenthesized Roman list markers", () => {
   const text = "Use (i) modifications, (ii) combinations, and (iv) replacements.";
   const aligned = alignText(text, [
