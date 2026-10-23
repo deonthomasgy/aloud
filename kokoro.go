@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,7 +44,7 @@ type rawTimestamp struct {
 }
 
 type captionedResponse struct {
-	Audio      string         `json:"audio"` // base64
+	Audio      []byte         `json:"audio"` // decoded directly from base64 by encoding/json
 	Timestamps []rawTimestamp `json:"timestamps"`
 }
 
@@ -117,8 +116,8 @@ func captioned(ctx context.Context, cfg config, client *http.Client, text, voice
 	}
 	defer resp.Body.Close()
 
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, nil, &upstreamHTTPError{
 			endpoint: "captioned_speech",
 			status:   resp.StatusCode,
@@ -127,15 +126,10 @@ func captioned(ctx context.Context, cfg config, client *http.Client, text, voice
 	}
 
 	var cr captionedResponse
-	if err := json.Unmarshal(raw, &cr); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
 		return nil, nil, fmt.Errorf("captioned_speech: bad JSON: %w", err)
 	}
-	audio, err := base64.StdEncoding.DecodeString(cr.Audio)
-	if err != nil {
-		return nil, nil, fmt.Errorf("captioned_speech: bad base64 audio: %w", err)
-	}
-
-	return audio, parseWordTimestamps(cr.Timestamps), nil
+	return cr.Audio, parseWordTimestamps(cr.Timestamps), nil
 }
 
 func parseWordTimestamps(raw []rawTimestamp) []WordTS {

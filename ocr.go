@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,7 +24,7 @@ Return JSON of the form {"page_number": 12, "continues_previous_page": false, "p
 
 // geminiRequest is the generateContent request body.
 type geminiRequest struct {
-	Contents         []geminiContent       `json:"contents"`
+	Contents         []geminiContent        `json:"contents"`
 	GenerationConfig geminiGenerationConfig `json:"generationConfig"`
 }
 
@@ -40,7 +39,7 @@ type geminiPart struct {
 
 type geminiInlineData struct {
 	MimeType string `json:"mime_type"`
-	Data     string `json:"data"` // base64
+	Data     []byte `json:"data"` // encoded directly to base64 by encoding/json
 }
 
 type geminiGenerationConfig struct {
@@ -79,7 +78,7 @@ func ocrImage(ctx context.Context, cfg config, client *http.Client, imageBytes [
 		Contents: []geminiContent{{
 			Parts: []geminiPart{
 				{Text: ocrPrompt},
-				{InlineData: &geminiInlineData{MimeType: mime, Data: base64.StdEncoding.EncodeToString(imageBytes)}},
+				{InlineData: &geminiInlineData{MimeType: mime, Data: imageBytes}},
 			},
 		}},
 		GenerationConfig: geminiGenerationConfig{
